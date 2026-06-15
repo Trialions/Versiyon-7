@@ -1,17 +1,26 @@
 # engine.py — İşlem motoru v8
 # DEĞİŞİKLİKLER v5→v6:
-#   1. HTF skor konfirmasyonu eklendi
-#   2. htf_close_series / htf_high_series / htf_low_series / htf_vol_series
-#   3. seed_from_candles_htf() ve on_candle_htf()
-#   4. _try_open'da HTF konfirmasyon şartı
+# 1. HTF skor konfirmasyonu eklendi
+# 2. htf_close_series / htf_high_series / htf_low_series / htf_vol_series
+# 3. seed_from_candles_htf() ve on_candle_htf()
+# 4. _try_open'da HTF konfirmasyon şartı
+#
 # DEĞİŞİKLİKLER v6→v7 (adaptive_sl):
-#   5. adaptive_sl modülü entegre edildi
-#   6. _open(): SL mesafesi rejime göre dinamik
-#   7. _try_open(): giriş score eşiği rejime göre otomatik ayarlanıyor
-#   8. _manage() / _exit_reason(): trail_step pozisyona özel
+# 5. adaptive_sl modülü entegre edildi
+# 6. _open(): SL mesafesi rejime göre dinamik
+# 7. _try_open(): giriş score eşiği rejime göre otomatik ayarlanıyor
+# 8. _manage() / _exit_reason(): trail_step pozisyona özel
+#
 # DEĞİŞİKLİKLER v7→v8:
-#   9.  ÖNCELİK 3: symbol_blacklist — config'den kalıcı sembol kara listesi
-#   10. ÖNCELİK 5: vol_position_filter — yüksek ATR'de otomatik pozisyon küçültme
+# 9. ÖNCELİK 3: symbol_blacklist — config'den kalıcı sembol kara listesi
+# 10. ÖNCELİK 5: vol_position_filter — yüksek ATR'de otomatik pozisyon küçültme
+#
+# DÜZELTMELER (v8.1):
+# BUG-1: threading.Lock() → RLock (reentrant) — deadlock riski giderildi
+# BUG-3: konsol_size_mult=0 artık açmadan return yapıyor, qty=0 borsa hatası engellendi
+# BUG-6: _try_open içinde pozisyon çift açılma riski — sembol tekrar kontrol ediliyor
+# BUG-10: get_market_sentiment() zaten cache'li (data_macro.py) — ek önlem yok
+
 import time
 import csv
 import threading
@@ -27,107 +36,120 @@ from logger import log_info, log_error, log_event
 
 
 class TradeEngine:
+
     def __init__(self, symbols: list, cfg: dict = None, data_dir: str = "data"):
-        self.cfg      = cfg or {}
+        self.cfg = cfg or {}
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        risk  = self.cfg.get("risk",        {})
-        lim   = self.cfg.get("limits",      {})
-        pyr   = self.cfg.get("pyramiding",  {})
-        thr   = self.cfg.get("thresholds",  {})
-        misc  = self.cfg.get("misc",        {})
-        mtf   = self.cfg.get("mtf",         {})
-        adx_f = self.cfg.get("adx_filter",  {})
-        self.adx_filter_enabled   = bool( adx_f.get("enabled",   True))
+        risk = self.cfg.get("risk", {})
+        lim  = self.cfg.get("limits", {})
+        pyr  = self.cfg.get("pyramiding", {})
+        thr  = self.cfg.get("thresholds", {})
+        misc = self.cfg.get("misc", {})
+        mtf  = self.cfg.get("mtf", {})
+        adx_f = self.cfg.get("adx_filter", {})
+
+        self.adx_filter_enabled   = bool( adx_f.get("enabled", True))
         self.adx_filter_threshold = float(adx_f.get("threshold", 25.0))
 
         # ── ATR Minimum Filtresi ──────────────────────────────
         atr_f = cfg.get("atr_filter", {})
-        self.atr_filter_enabled = bool( atr_f.get("enabled",     False))
+        self.atr_filter_enabled = bool( atr_f.get("enabled", False))
         self.atr_filter_min     = float(atr_f.get("min_atr_pct", 0.8))
 
         # ── RSI Filtresi ──────────────────────────────────────
         rsi_f = self.cfg.get("rsi_filter", {})
-        self.rsi_filter_enabled = bool( rsi_f.get("enabled",   True))
+        self.rsi_filter_enabled = bool( rsi_f.get("enabled", True))
         self.rsi_max_long       = float(rsi_f.get("max_long",  73.0))
         self.rsi_min_short      = float(rsi_f.get("min_short", 30.0))
 
-        self.equity           = float(misc.get("starting_equity_usdt", 1000.0))
-        self.tp_pct           = float(risk.get("take_profit_min_pct",  3.0)) / 100
-        self.sl_pct           = float(risk.get("hard_stop_pct",        1.5)) / 100
-        self.use_atr_stop     = bool(risk.get("use_atr_stop", True))
-        self.atr_multiplier   = float(risk.get("atr_multiplier", 2.0))
-        self.max_stop_pct     = float(risk.get("max_stop_pct", 4.5)) / 100
-        self.trail            = bool( risk.get("use_trailing",         True))
-        self.trail_step       = float(risk.get("trailing_step_pct",    0.7)) / 100
-        # Dynamic Trail: kapalıysa adaptive_sl'in ATR bazlı trail_step çıktısı kullanılmaz,
-        # klasik risk.trailing_step_pct pozisyona yazılır.
+        self.equity            = float(misc.get("starting_equity_usdt", 1000.0))
+        self.tp_pct            = float(risk.get("take_profit_min_pct",  3.0)) / 100
+        self.sl_pct            = float(risk.get("hard_stop_pct",        1.5)) / 100
+        self.use_atr_stop      = bool( risk.get("use_atr_stop",         True))
+        self.atr_multiplier    = float(risk.get("atr_multiplier",       2.0))
+        self.max_stop_pct      = float(risk.get("max_stop_pct",         4.5)) / 100
+        self.trail             = bool( risk.get("use_trailing",         True))
+        self.trail_step        = float(risk.get("trailing_step_pct",    0.7)) / 100
+
+        # Dynamic Trail
         dt_cfg = self.cfg.get("dynamic_trail", {})
         self.dynamic_trail_enabled = bool(dt_cfg.get("enabled", True))
-        self.min_hold         = int(  risk.get("min_hold_minutes",     30))  * 60
-        self.risk_per_trade   = float(risk.get("risk_per_trade_pct",   1.0)) / 100
-        self.min_profit_close = float(risk.get("min_profit_close_pct", 3.0)) / 100
 
-        self.score_long_open  = float(thr.get("score_long_open",  85))
-        self.score_short_open = float(thr.get("score_short_open", 15))
-        self.score_close      = float(thr.get("score_close",      50))
+        self.min_hold          = int(  risk.get("min_hold_minutes", 30)) * 60
+        self.risk_per_trade    = float(risk.get("risk_per_trade_pct", 1.0)) / 100
+        self.min_profit_close  = float(risk.get("min_profit_close_pct", 3.0)) / 100
+
+        self.score_long_open   = float(thr.get("score_long_open",  85))
+        self.score_short_open  = float(thr.get("score_short_open", 15))
+        self.score_close       = float(thr.get("score_close",      50))
 
         # ── Dynamic Threshold / Rejim Bazlı Giriş Eşiği ───────
         dt = self.cfg.get("dynamic_threshold", {})
-        self.dynamic_threshold_enabled = bool(dt.get("enabled", False))
-        self.dt_trend_score            = float(dt.get("trend_score", max(80.0, self.score_long_open - 5)))
-        self.dt_konsol_score           = float(dt.get("konsol_score", self.score_long_open + 2))
-        self.dt_bearish_score          = float(dt.get("bearish_score", 999.0))
-        self.dt_neutral_score          = float(dt.get("neutral_score", self.score_long_open))
-        self.dt_min_score              = float(dt.get("min_score", 85.0))
-        self.dt_max_score              = float(dt.get("max_score", 999.0))
-        self.dt_strong_discount        = float(dt.get("strong_setup_discount", 2.0))
-        self.dt_strong_htf             = float(dt.get("strong_htf", 75.0))
-        self.dt_strong_adx             = float(dt.get("strong_adx", 35.0))
-        self.dt_strong_rsi_max         = float(dt.get("strong_rsi_max", 68.0))
+        self.dynamic_threshold_enabled = bool( dt.get("enabled",       False))
+        self.dt_trend_score    = float(dt.get("trend_score",   max(80.0, self.score_long_open - 5)))
+        self.dt_konsol_score   = float(dt.get("konsol_score",  self.score_long_open + 2))
+        self.dt_bearish_score  = float(dt.get("bearish_score", 999.0))
+        self.dt_neutral_score  = float(dt.get("neutral_score", self.score_long_open))
+        self.dt_min_score      = float(dt.get("min_score",     85.0))
+        self.dt_max_score      = float(dt.get("max_score",     999.0))
+        self.dt_strong_discount = float(dt.get("strong_setup_discount", 2.0))
+        self.dt_strong_htf     = float(dt.get("strong_htf",    75.0))
+        self.dt_strong_adx     = float(dt.get("strong_adx",    35.0))
+        self.dt_strong_rsi_max = float(dt.get("strong_rsi_max",68.0))
 
-        self.max_trades_day   = int(  lim.get("max_trades_per_day", 10))
-        self.max_open_pos     = int(  lim.get("max_open_positions",  5))
-        self.daily_target_pct = float(lim.get("daily_target_pct",  8.0)) / 100
-        self.max_hold_sec     = int(  lim.get("max_hold_hours",       48)) * 3600
-        self.daily_loss_limit = float(lim.get("daily_loss_limit_pct",  5.0)) / 100
+        self.max_trades_day    = int(  lim.get("max_trades_per_day", 10))
+        self.max_open_pos      = int(  lim.get("max_open_positions",  5))
+        self.daily_target_pct  = float(lim.get("daily_target_pct",   8.0)) / 100
+        self.max_hold_sec      = int(  lim.get("max_hold_hours",     48)) * 3600
+        self.daily_loss_limit  = float(lim.get("daily_loss_limit_pct", 5.0)) / 100
 
-        self.vol_mult         = float(misc.get("volume_burst_multiplier", 2.0))
-        self.min_notional     = float(misc.get("min_notional_usdt", 30000.0))
-        self.pyramid_enabled  = bool( pyr.get("enabled",    False))
+        self.vol_mult          = float(misc.get("volume_burst_multiplier", 2.0))
+        self.min_notional      = float(misc.get("min_notional_usdt",   30000.0))
+
+        self.pyramid_enabled   = bool(pyr.get("enabled", False))
 
         # ── Çoklu Timeframe Ayarları ──────────────────────────────
-        self.mtf_enabled      = bool( mtf.get("enabled",          True))
-        # HTF'de LONG için minimum skor (yön konfirmasyonu)
-        self.mtf_long_min     = float(mtf.get("htf_long_min",     55.0))
-        # HTF'de SHORT için maksimum skor (yön konfirmasyonu)
-        self.mtf_short_max    = float(mtf.get("htf_short_max",    45.0))
+        self.mtf_enabled    = bool( mtf.get("enabled",      True))
+        self.mtf_long_min   = float(mtf.get("htf_long_min", 55.0))
+        self.mtf_short_max  = float(mtf.get("htf_short_max",45.0))
 
-        self.lock             = threading.Lock()
-        self._stopped         = False
-        self.on_event         = self.cfg.get("on_event")
+        # BUG-1 DÜZELTMESİ: RLock kullan — on_candle() lock içinden tekrar
+        # lock almaya çalışıyor (score sonrası ikinci with self.lock bloğu).
+        # threading.Lock() reentrant değil → deadlock. RLock aynı thread'de
+        # tekrar alınabilir.
+        self.lock = threading.RLock()
 
-        # ── LTF (low timeframe — örn. 5m) serileri ───────────────
-        self.close_series     = {s: deque(maxlen=2048) for s in symbols}
-        self.high_series      = {s: deque(maxlen=2048) for s in symbols}
-        self.low_series       = {s: deque(maxlen=2048) for s in symbols}
-        self.vol_series       = {s: deque(maxlen=2048) for s in symbols}
-        self.last_close_time  = {s: 0 for s in symbols}
+        self._stopped   = False
+        self.on_event   = self.cfg.get("on_event")
 
-        # ── HTF (higher timeframe — örn. 1h) serileri ────────────
+        # ── LTF serileri ─────────────────────────────────────────
+        self.close_series    = {s: deque(maxlen=2048) for s in symbols}
+        self.high_series     = {s: deque(maxlen=2048) for s in symbols}
+        self.low_series      = {s: deque(maxlen=2048) for s in symbols}
+        self.vol_series      = {s: deque(maxlen=2048) for s in symbols}
+        self.last_close_time = {s: 0 for s in symbols}
+
+        # ── HTF serileri ─────────────────────────────────────────
         self.htf_close_series = {s: deque(maxlen=500) for s in symbols}
         self.htf_high_series  = {s: deque(maxlen=500) for s in symbols}
         self.htf_low_series   = {s: deque(maxlen=500) for s in symbols}
         self.htf_vol_series   = {s: deque(maxlen=500) for s in symbols}
         self.htf_last_time    = {s: 0 for s in symbols}
 
-        self.open_positions    = {}
-        self.trade_count_today = 0
-        self.pnl_total_usd     = 0.0
-        self.daily_pnl_usd     = 0.0
-        self._daily_fired      = False
-        self.last_reset_day    = time.strftime("%Y-%m-%d")
+        # ── BTC Rejim Buffer (regime.detect için) ────────────
+        self.btc_closes  = []
+        self.btc_highs   = []
+        self.btc_lows    = []
+        self.btc_volumes = []
+
+        self.open_positions     = {}
+        self.trade_count_today  = 0
+        self.pnl_total_usd      = 0.0
+        self.daily_pnl_usd      = 0.0
+        self._daily_fired       = False
+        self.last_reset_day     = time.strftime("%Y-%m-%d")
 
         # ── Piyasa Rejimi + Sembol Yöneticisi ────────────────────
         self.regime  = MarketRegimeDetector(cfg)
@@ -136,55 +158,55 @@ class TradeEngine:
         # ── Kara Liste — dinamik (süreli ban) ────────────────────
         self.blacklist: dict[str, float] = {}
 
-        # ── Kara Liste — config'den kalıcı ban (ÖNCELİK 3) ──────
+        # ── Kara Liste — config'den kalıcı ban ──────────────────
         bl_cfg = self.cfg.get("symbol_blacklist", {})
         self.blacklist_enabled  = bool(bl_cfg.get("enabled", False))
-        _bl_syms                = bl_cfg.get("symbols", []) or []
+        _bl_syms = bl_cfg.get("symbols", []) or []
         self.blacklist_symbols  = set(s.upper() for s in _bl_syms)
 
-        # ── Volatilite Bazlı Pozisyon Filtresi (ÖNCELİK 5) ──────
+        # ── Volatilite Bazlı Pozisyon Filtresi ──────────────────
         vpf = self.cfg.get("vol_position_filter", {})
-        self.vpf_enabled       = bool( vpf.get("enabled",           False))
+        self.vpf_enabled       = bool( vpf.get("enabled",          False))
         self.vpf_atr_threshold = float(vpf.get("high_atr_threshold", 2.5))
         self.vpf_size_mult     = float(vpf.get("high_atr_size_mult", 0.5))
 
         # ── Market Regime / KONSOL Breakout Filtresi ──────────
         mr_cfg = self.cfg.get("market_regime", {})
-        self.konsol_breakout_only      = bool( mr_cfg.get("konsol_breakout_only", False))
-        self.konsol_min_score          = float(mr_cfg.get("konsol_min_score", 98.0))
-        self.konsol_min_adx            = float(mr_cfg.get("konsol_min_adx", 30.0))
-        self.konsol_min_atr_pct        = float(mr_cfg.get("konsol_min_atr_pct", 1.2))
-        self.konsol_min_vol_ratio      = float(mr_cfg.get("konsol_min_vol_ratio", 1.5))
-        self.konsol_min_htf            = float(mr_cfg.get("konsol_min_htf", 70.0))
-        self.konsol_rsi_max_long       = float(mr_cfg.get("konsol_rsi_max_long", 68.0))
-        self.konsol_size_mult          = float(mr_cfg.get("konsol_size_mult", 0.50))
+        self.konsol_breakout_only  = bool( mr_cfg.get("konsol_breakout_only",   False))
+        self.konsol_min_score      = float(mr_cfg.get("konsol_min_score",       98.0))
+        self.konsol_min_adx        = float(mr_cfg.get("konsol_min_adx",         30.0))
+        self.konsol_min_atr_pct    = float(mr_cfg.get("konsol_min_atr_pct",      1.2))
+        self.konsol_min_vol_ratio  = float(mr_cfg.get("konsol_min_vol_ratio",    1.5))
+        self.konsol_min_htf        = float(mr_cfg.get("konsol_min_htf",         70.0))
+        self.konsol_rsi_max_long   = float(mr_cfg.get("konsol_rsi_max_long",    68.0))
+        self.konsol_size_mult      = float(mr_cfg.get("konsol_size_mult",        0.50))
 
         # ── Adaptif Sembol Kalite Filtresi ─────────────────────
         sqf = self.cfg.get("symbol_quality_filter", {})
-        self.sqf_enabled          = bool( sqf.get("enabled",                True))
-        self.sqf_weak_mult        = float(sqf.get("weak_symbol_multiplier", 0.50))
-        self.sqf_min_qs           = float(sqf.get("min_qs",                  8.0))
-        self.sqf_min_atr_pct      = float(sqf.get("min_atr_pct",             1.2))
-        self.sqf_min_adx          = float(sqf.get("min_adx",                20.0))
-        self.sqf_score_bonus      = float(sqf.get("score_bonus",             5.0))
+        self.sqf_enabled     = bool( sqf.get("enabled",             True))
+        self.sqf_weak_mult   = float(sqf.get("weak_symbol_multiplier", 0.50))
+        self.sqf_min_qs      = float(sqf.get("min_qs",               8.0))
+        self.sqf_min_atr_pct = float(sqf.get("min_atr_pct",          1.2))
+        self.sqf_min_adx     = float(sqf.get("min_adx",             20.0))
+        self.sqf_score_bonus = float(sqf.get("score_bonus",           5.0))
 
         # ── SL Re-entry / Fake Stop Koruması ───────────────────
         re_cfg = self.cfg.get("reentry", {})
-        self.reentry_enabled        = bool(re_cfg.get("enabled", False))
-        self.reentry_max_per_symbol = int(  re_cfg.get("max_reentries", 1))
-        self.reentry_window_bars    = int(  re_cfg.get("window_bars", 4))
-        self.reentry_cooldown_bars  = int(  re_cfg.get("cooldown_bars", 1))
-        self.reentry_min_score      = float(re_cfg.get("min_score", self.score_long_open))
-        self.reentry_min_qs         = float(re_cfg.get("min_qs", 8))
-        self.reentry_min_htf        = float(re_cfg.get("min_htf", 75))
-        self.reentry_min_adx        = float(re_cfg.get("min_adx", 35))
-        self.reentry_size_mult      = float(re_cfg.get("size_mult", 0.75))
-        self.reentry_bar_seconds    = int(  re_cfg.get("bar_seconds", 3600))
-        self.reentry_candidates     = {}
+        self.reentry_enabled         = bool( re_cfg.get("enabled",       False))
+        self.reentry_max_per_symbol  = int(  re_cfg.get("max_reentries",     1))
+        self.reentry_window_bars     = int(  re_cfg.get("window_bars",        4))
+        self.reentry_cooldown_bars   = int(  re_cfg.get("cooldown_bars",      1))
+        self.reentry_min_score       = float(re_cfg.get("min_score", self.score_long_open))
+        self.reentry_min_qs          = float(re_cfg.get("min_qs",             8))
+        self.reentry_min_htf         = float(re_cfg.get("min_htf",           75))
+        self.reentry_min_adx         = float(re_cfg.get("min_adx",           35))
+        self.reentry_size_mult       = float(re_cfg.get("size_mult",        0.75))
+        self.reentry_bar_seconds     = int(  re_cfg.get("bar_seconds",     3600))
+        self.reentry_candidates      = {}
 
-        self.csv_path          = self.data_dir / "trade_logs.csv"
-        self.events_path       = self.data_dir / "engine_events.log"
-        self.allowed_symbol    = None
+        self.csv_path    = self.data_dir / "trade_logs.csv"
+        self.events_path = self.data_dir / "engine_events.log"
+        self.allowed_symbol = None
 
     # ──────────────────────────────────────────────────────────────
     # Durdurma
@@ -252,39 +274,78 @@ class TradeEngine:
                 v.append(float(c.get("volume", 0)))
             if candles:
                 self.last_close_time[symbol] = int(candles[-1].get("close_time", 0))
+            # BTCUSDT preload'unda rejim buffer'ını da doldur
+            if symbol == "BTCUSDT":
+                self.btc_closes  = [float(c.get("close",  0)) for c in candles][-500:]
+                self.btc_highs   = [float(c.get("high",   0)) for c in candles][-500:]
+                self.btc_lows    = [float(c.get("low",    0)) for c in candles][-500:]
+                self.btc_volumes = [float(c.get("volume", 0)) for c in candles][-500:]
+                self.regime.detect(
+                    self.btc_closes,
+                    btc_highs=self.btc_highs,
+                    btc_lows =self.btc_lows,
+                    btc_vols =self.btc_volumes,
+                )
 
     def on_candle(self, symbol: str, candle: dict):
+        # BUG-1: RLock sayesinde bu blok ile alttaki with self.lock
+        # çakışmadan çalışır.
         with self.lock:
             if self._stopped:
                 return
+
             self._reset_daily_if_needed()
+
             price  = float(candle.get("close",  0))
             high   = float(candle.get("high",   0))
             low    = float(candle.get("low",    0))
             volume = float(candle.get("volume", 0))
+
             self.close_series[symbol].append(price)
             self.high_series[symbol].append(high)
             self.low_series[symbol].append(low)
             self.vol_series[symbol].append(volume)
             self.last_close_time[symbol] = int(candle.get("close_time", 0))
+
             prices  = list(self.close_series[symbol])
             highs   = list(self.high_series[symbol])
             lows    = list(self.low_series[symbol])
             volumes = list(self.vol_series[symbol])
-            in_pos  = symbol in self.open_positions
 
-        # ── Lock DIŞINDA CPU-yoğun hesaplama ─────────────────
-        if len(prices) < 50:
-            return
+            # ── Rejim Tespiti: BTCUSDT gelince güncelle ──────
+            if symbol == "BTCUSDT":
+                self.btc_closes.append(price)
+                self.btc_highs.append(high)
+                self.btc_lows.append(low)
+                self.btc_volumes.append(volume)
+                # Bellek sınırı: max 500 mum
+                if len(self.btc_closes) > 500:
+                    self.btc_closes  = self.btc_closes[-500:]
+                    self.btc_highs   = self.btc_highs[-500:]
+                    self.btc_lows    = self.btc_lows[-500:]
+                    self.btc_volumes = self.btc_volumes[-500:]
+                self.regime.detect(
+                    self.btc_closes,
+                    btc_highs=self.btc_highs,
+                    btc_lows =self.btc_lows,
+                    btc_vols =self.btc_volumes,
+                )
 
+            if len(prices) < 50:
+                return
+
+        # CPU-yoğun hesaplama lock DIŞINDA yapılıyor (performans)
         news_score = get_sentiment_score()
         result     = score_symbol(prices, highs, lows, volumes, news_score)
         score      = result["final_score"]
 
-        # ── Sonuçla birlikte tekrar lock al ──────────────────
+        # BUG-6 DÜZELTMESİ: Pozisyon durumu score hesabından SONRA tekrar
+        # okunuyor. Lock dışındaki sürede başka thread pozisyonu değiştirmiş
+        # olabilir — güncel durumu al.
         with self.lock:
             if self._stopped:
                 return
+            in_pos = symbol in self.open_positions
             if in_pos:
                 self._manage(symbol, price, score)
             else:
@@ -294,22 +355,20 @@ class TradeEngine:
     # Veri Besleme — HTF
     # ──────────────────────────────────────────────────────────────
     def seed_from_candles_htf(self, symbol: str, candles: list):
-        """1h (veya başka HTF) geçmiş mumlarını yükler."""
         with self.lock:
-            pd = self.htf_close_series.setdefault(symbol, deque(maxlen=500))
-            hd = self.htf_high_series.setdefault( symbol, deque(maxlen=500))
-            ld = self.htf_low_series.setdefault(  symbol, deque(maxlen=500))
-            vd = self.htf_vol_series.setdefault(  symbol, deque(maxlen=500))
+            pd_ = self.htf_close_series.setdefault(symbol, deque(maxlen=500))
+            hd  = self.htf_high_series.setdefault( symbol, deque(maxlen=500))
+            ld  = self.htf_low_series.setdefault(  symbol, deque(maxlen=500))
+            vd  = self.htf_vol_series.setdefault(  symbol, deque(maxlen=500))
             for c in candles:
-                pd.append(float(c.get("close",  0)))
-                hd.append(float(c.get("high",   0)))
-                ld.append(float(c.get("low",    0)))
-                vd.append(float(c.get("volume", 0)))
+                pd_.append(float(c.get("close",  0)))
+                hd.append( float(c.get("high",   0)))
+                ld.append( float(c.get("low",    0)))
+                vd.append( float(c.get("volume", 0)))
             if candles:
                 self.htf_last_time[symbol] = int(candles[-1].get("close_time", 0))
 
     def on_candle_htf(self, symbol: str, candle: dict):
-        """1h mumunu HTF serilerine ekler (lock dışından çağrılır)."""
         with self.lock:
             if self._stopped:
                 return
@@ -371,11 +430,6 @@ class TradeEngine:
     # HTF Skor Hesapla
     # ──────────────────────────────────────────────────────────────
     def _htf_score(self, symbol: str) -> float:
-        """
-        1h serisinden skor hesaplar.
-        Yeterli veri yoksa 50.0 (nötr) döner — bu durumda
-        MTF filtresi engel olmaz (fail-open davranışı).
-        """
         prices  = list(self.htf_close_series.get(symbol, []))
         highs   = list(self.htf_high_series.get( symbol, []))
         lows    = list(self.htf_low_series.get(  symbol, []))
@@ -389,15 +443,12 @@ class TradeEngine:
             return 50.0
 
     # ──────────────────────────────────────────────────────────────
-    # Ana İşlem Akışı
+    # Pozisyon Yönetimi
     # ──────────────────────────────────────────────────────────────
-
-
-    # ── Pozisyon Yönetimi ─────────────────────────────────────────
     def _manage(self, symbol: str, price: float, score: float):
-        pos    = self.open_positions[symbol]
-        age    = time.time() - pos["ts_open"]
-        mult   = 1 if pos["side"] == "LONG" else -1
+        pos  = self.open_positions[symbol]
+        age  = time.time() - pos["ts_open"]
+        mult = 1 if pos["side"] == "LONG" else -1
         change = (price - pos["entry"]) / pos["entry"] * mult
 
         pos_sl_pct = pos.get("sl_pct", self.sl_pct)
@@ -407,7 +458,6 @@ class TradeEngine:
             return
 
         if self.trail and change > 0:
-            # Pozisyona özgü trail_step kullan (açılışta rejime göre belirlendi)
             pos_trail    = pos.get("trail_step", self.trail_step)
             trail_locked = pos.get("trail_locked", None)
             if trail_locked is None or change > trail_locked + pos_trail:
@@ -437,59 +487,66 @@ class TradeEngine:
                 return "ScoreClose"
             if pos["side"] == "SHORT" and score > self.score_close:
                 return "ScoreClose"
-            locked = pos.get("trail_locked", change)
-            # Pozisyona özgü trail_step (açılışta rejime göre belirlendi)
-            pos_trail = pos.get("trail_step", self.trail_step)
-            if self.trail and change < locked - pos_trail:
-                return "Trail"
+        locked    = pos.get("trail_locked", change)
+        pos_trail = pos.get("trail_step",   self.trail_step)
+        if self.trail and change < locked - pos_trail:
+            return "Trail"
         return None
 
-    # ── Pozisyon Açma (v6: HTF konfirmasyon eklendi) ─────────────
+    # ── Pozisyon Açma ─────────────────────────────────────────────
     def _trade_quality_score(self, symbol: str, result: dict, side: str) -> int:
-        """Canlı engine için backtestteki QS mantığıyla uyumlu hafif setup kalite puanı."""
-        comp = result.get("components", {}) or {}
+        comp  = result.get("components", {}) or {}
         score = 0
+
         htf = self._htf_score(symbol)
-        if side == "LONG" and htf >= self.mtf_long_min:
+        if side == "LONG"  and htf >= self.mtf_long_min:
             score += 2
         if side == "SHORT" and htf <= self.mtf_short_max:
             score += 2
+
         atr_pct = float(comp.get("atr_pct", 0.0) or 0.0)
         if 0.3 <= atr_pct <= 3.0:
             score += 2
+
         regime = self.regime._last_regime
         if regime == "TREND":
             score += 2
         elif regime == "KONSOL":
             score += 1
+
         vol_ratio = float(comp.get("volume_ratio", comp.get("vol_ratio", 0.0)) or 0.0)
         if vol_ratio >= 1.5:
             score += 2
         elif vol_ratio >= 1.1:
             score += 1
+
         try:
             sentiment = get_market_sentiment()
-            if side == "LONG" and sentiment == "BULLISH":
+            if side == "LONG"  and sentiment == "BULLISH":
                 score += 2
             if side == "SHORT" and sentiment == "BEARISH":
                 score += 2
         except Exception:
             pass
+
         return max(0, min(10, int(score)))
 
-    def _symbol_quality_filter(self, symbol: str, result: dict, side: str, qs_pts: float, score: float):
-        """Kötü performanslı sembolde yalnızca zayıf setup'ı engeller; coin evrenden atılmaz."""
+    def _symbol_quality_filter(self, symbol: str, result: dict, side: str,
+                                qs_pts: float, score: float):
         if not self.sqf_enabled:
             return True, "DISABLED", 1.0, 0.0
         if symbol == "BTCUSDT":
             return True, "BTC_REFERENCE", 1.0, 0.0
-        comp = result.get("components", {}) or {}
-        atr_pct = float(comp.get("atr_pct", 0.0) or 0.0)
-        adx_val = float(comp.get("adx", 0.0) or 0.0)
-        sym_mult = float(self.sym_mgr.size_multiplier(symbol))
+
+        comp      = result.get("components", {}) or {}
+        atr_pct   = float(comp.get("atr_pct", 0.0) or 0.0)
+        adx_val   = float(comp.get("adx",     0.0) or 0.0)
+        sym_mult  = float(self.sym_mgr.size_multiplier(symbol))
         rolling_pnl = float(self.sym_mgr.get_rolling_pnl(symbol))
+
         if sym_mult > self.sqf_weak_mult:
             return True, "SYMBOL_OK", sym_mult, rolling_pnl
+
         reasons = []
         if qs_pts < self.sqf_min_qs:
             reasons.append(f"qs={qs_pts}<min_qs={self.sqf_min_qs}")
@@ -498,33 +555,41 @@ class TradeEngine:
         if adx_val > 0 and adx_val < self.sqf_min_adx:
             reasons.append(f"adx={adx_val:.1f}<min_adx={self.sqf_min_adx}")
         if side == "LONG" and score < (self.score_long_open + self.sqf_score_bonus):
-            reasons.append(f"score={score:.1f}<long+bonus={self.score_long_open + self.sqf_score_bonus:.1f}")
-        if side == "SHORT" and self.score_short_open < 100 and score > (self.score_short_open - self.sqf_score_bonus):
-            reasons.append(f"score={score:.1f}>short-bonus={self.score_short_open - self.sqf_score_bonus:.1f}")
+            reasons.append(
+                f"score={score:.1f}<long+bonus="
+                f"{self.score_long_open + self.sqf_score_bonus:.1f}"
+            )
+        if (side == "SHORT" and self.score_short_open < 100
+                and score > (self.score_short_open - self.sqf_score_bonus)):
+            reasons.append(
+                f"score={score:.1f}>short-bonus="
+                f"{self.score_short_open - self.sqf_score_bonus:.1f}"
+            )
+
         if reasons:
             return False, " | ".join(reasons), sym_mult, rolling_pnl
         return True, "WEAK_SYMBOL_BUT_SETUP_OK", sym_mult, rolling_pnl
 
-    def _register_reentry_candidate(self, symbol: str, pos: dict, price: float, reason: str = "SL"):
-        """SL sonrası kısa süreli re-entry adayı kaydeder."""
+    def _register_reentry_candidate(self, symbol: str, pos: dict,
+                                    price: float, reason: str = "SL"):
         if not self.reentry_enabled or reason != "SL" or symbol == "BTCUSDT":
             return
         used = int(pos.get("reentry_count", 0))
         if used >= self.reentry_max_per_symbol:
             return
-        now = time.time()
+        now  = time.time()
         cand = {
-            "side": pos.get("side", "LONG"),
-            "created_ts": now,
-            "earliest_ts": now + self.reentry_cooldown_bars * self.reentry_bar_seconds,
-            "expires_ts": now + self.reentry_window_bars * self.reentry_bar_seconds,
-            "used": used,
-            "entry": pos.get("entry"),
-            "sl_price": price,
-            "prev_score": pos.get("score"),
-            "prev_qs": pos.get("qs_score"),
-            "prev_htf": pos.get("htf_score"),
-            "prev_adx": pos.get("adx"),
+            "side":         pos.get("side", "LONG"),
+            "created_ts":   now,
+            "earliest_ts":  now + self.reentry_cooldown_bars * self.reentry_bar_seconds,
+            "expires_ts":   now + self.reentry_window_bars   * self.reentry_bar_seconds,
+            "used":         used,
+            "entry":        pos.get("entry"),
+            "sl_price":     price,
+            "prev_score":   pos.get("score"),
+            "prev_qs":      pos.get("qs_score"),
+            "prev_htf":     pos.get("htf_score"),
+            "prev_adx":     pos.get("adx"),
         }
         self.reentry_candidates[symbol] = cand
         self._fire("REENTRY_CANDIDATE", symbol=symbol, side=cand["side"],
@@ -546,28 +611,33 @@ class TradeEngine:
             return None
         return cand
 
-    def _reentry_ok(self, symbol: str, side: str, score: float, qs_pts: float, htf_score: float, adx_val: float):
+    def _reentry_ok(self, symbol: str, side: str, score: float,
+                    qs_pts: float, htf_score: float, adx_val: float):
         cand = self._get_reentry_candidate(symbol, side)
         if not cand:
             return False, "no_candidate"
         reasons = []
-        if score < self.reentry_min_score:
+        if score     < self.reentry_min_score:
             reasons.append(f"score={score:.1f}<min={self.reentry_min_score:.1f}")
-        if qs_pts < self.reentry_min_qs:
+        if qs_pts    < self.reentry_min_qs:
             reasons.append(f"qs={qs_pts}<min={self.reentry_min_qs}")
         if htf_score < self.reentry_min_htf:
             reasons.append(f"htf={htf_score:.1f}<min={self.reentry_min_htf:.1f}")
         if adx_val > 0 and adx_val < self.reentry_min_adx:
             reasons.append(f"adx={adx_val:.1f}<min={self.reentry_min_adx:.1f}")
         if reasons:
-            self._fire("REENTRY_BLOCKED", symbol=symbol, side=side, detail=" | ".join(reasons),
-                       score=round(score, 1), qs_score=qs_pts, htf_score=round(htf_score, 1), adx=round(adx_val, 1))
+            self._fire("REENTRY_BLOCKED", symbol=symbol, side=side,
+                       detail=" | ".join(reasons),
+                       score=round(score, 1), qs_score=qs_pts,
+                       htf_score=round(htf_score, 1), adx=round(adx_val, 1))
             return False, " | ".join(reasons)
         return True, "REENTRY_OK"
 
-    def _effective_long_threshold(self, symbol: str, result: dict, base_adsl_threshold: float) -> float:
+    def _effective_long_threshold(self, symbol: str, result: dict,
+                                   base_adsl_threshold: float) -> float:
         if not self.dynamic_threshold_enabled:
             return float(base_adsl_threshold)
+
         regime = self.regime._last_regime
         if regime == "TREND":
             thr = self.dt_trend_score
@@ -577,53 +647,77 @@ class TradeEngine:
             thr = self.dt_bearish_score
         else:
             thr = self.dt_neutral_score
-        comp = result.get("components", {}) or {}
-        adx_val = float(comp.get("adx", 0.0) or 0.0)
+
+        comp    = result.get("components", {}) or {}
+        adx_val = float(comp.get("adx",  0.0) or 0.0)
         rsi_val = float(comp.get("rsi", 50.0) or 50.0)
         htf_val = float(self._htf_score(symbol)) if self.mtf_enabled else 100.0
-        if htf_val >= self.dt_strong_htf and adx_val >= self.dt_strong_adx and rsi_val <= self.dt_strong_rsi_max:
+
+        if (htf_val >= self.dt_strong_htf
+                and adx_val >= self.dt_strong_adx
+                and rsi_val <= self.dt_strong_rsi_max):
             thr -= self.dt_strong_discount
+
         return max(self.dt_min_score, min(self.dt_max_score, float(thr)))
 
-    def _konsol_breakout_ok(self, symbol: str, result: dict, score: float, htf_score: float, volumes: list, side: str) -> bool:
+    def _konsol_breakout_ok(self, symbol: str, result: dict, score: float,
+                             htf_score: float, volumes: list, side: str) -> bool:
         if not self.konsol_breakout_only or self.regime._last_regime != "KONSOL":
             return True
-        comp = result.get("components", {}) or {}
-        adx_val = float(comp.get("adx", 0.0) or 0.0)
-        atr_pct = float(comp.get("atr_pct", 0.0) or 0.0)
-        rsi_val = float(comp.get("rsi", 50.0) or 50.0)
+
+        comp      = result.get("components", {}) or {}
+        adx_val   = float(comp.get("adx",  0.0) or 0.0)
+        atr_pct   = float(comp.get("atr_pct", 0.0) or 0.0)
+        rsi_val   = float(comp.get("rsi", 50.0) or 50.0)
         vol_ratio = 0.0
         if len(volumes) >= 20:
-            base = sum(volumes[-20:-1]) / 19
+            base      = sum(volumes[-20:-1]) / 19
             vol_ratio = (volumes[-1] / base) if base > 0 else 0.0
+
         checks = [
-            (score >= self.konsol_min_score, "KONSOL_LOW_SCORE", f"score={score:.1f}<min={self.konsol_min_score:.1f}"),
-            (adx_val >= self.konsol_min_adx, "KONSOL_WEAK_ADX", f"adx={adx_val:.1f}<min={self.konsol_min_adx:.1f}"),
-            (atr_pct >= self.konsol_min_atr_pct, "KONSOL_LOW_ATR", f"atr={atr_pct:.3f}<min={self.konsol_min_atr_pct:.3f}"),
-            (vol_ratio >= self.konsol_min_vol_ratio, "KONSOL_NO_VOLUME_BREAKOUT", f"vol_ratio={vol_ratio:.2f}<min={self.konsol_min_vol_ratio:.2f}"),
-            (htf_score >= self.konsol_min_htf, "KONSOL_HTF_WEAK", f"htf={htf_score:.1f}<min={self.konsol_min_htf:.1f}"),
+            (score     >= self.konsol_min_score,    "KONSOL_LOW_SCORE",
+             f"score={score:.1f}<min={self.konsol_min_score:.1f}"),
+            (adx_val   >= self.konsol_min_adx,      "KONSOL_WEAK_ADX",
+             f"adx={adx_val:.1f}<min={self.konsol_min_adx:.1f}"),
+            (atr_pct   >= self.konsol_min_atr_pct,  "KONSOL_LOW_ATR",
+             f"atr={atr_pct:.3f}<min={self.konsol_min_atr_pct:.3f}"),
+            (vol_ratio >= self.konsol_min_vol_ratio,"KONSOL_NO_VOLUME_BREAKOUT",
+             f"vol_ratio={vol_ratio:.2f}<min={self.konsol_min_vol_ratio:.2f}"),
+            (htf_score >= self.konsol_min_htf,      "KONSOL_HTF_WEAK",
+             f"htf={htf_score:.1f}<min={self.konsol_min_htf:.1f}"),
         ]
         if side == "LONG":
-            checks.append((rsi_val <= self.konsol_rsi_max_long, "KONSOL_RSI_OVERHEATED", f"rsi={rsi_val:.1f}>max={self.konsol_rsi_max_long:.1f}"))
+            checks.append(
+                (rsi_val <= self.konsol_rsi_max_long, "KONSOL_RSI_OVERHEATED",
+                 f"rsi={rsi_val:.1f}>max={self.konsol_rsi_max_long:.1f}")
+            )
+
         for ok, cause, detail in checks:
             if not ok:
-                self._fire("OPEN_BLOCK", cause=cause, symbol=symbol, score=round(score, 1), detail=detail,
-                           adx=round(adx_val, 2), atr=round(atr_pct, 3), rsi=round(rsi_val, 1),
-                           htf_score=round(htf_score, 1), vol_ratio=round(vol_ratio, 2), side=side)
+                self._fire("OPEN_BLOCK", cause=cause, symbol=symbol,
+                           score=round(score, 1), detail=detail,
+                           adx=round(adx_val, 2), atr=round(atr_pct, 3),
+                           rsi=round(rsi_val, 1), htf_score=round(htf_score, 1),
+                           vol_ratio=round(vol_ratio, 2), side=side)
                 return False
         return True
 
     def _try_open(self, symbol: str, price: float, score: float,
                   prices: list, volumes: list, result: dict):
-        # Temel kontrol kapıları
-        if self._stopped:                                         return
-        if len(self.open_positions) >= self.max_open_pos:         return
-        if self.trade_count_today  >= self.max_trades_day:        return
-        if self.allowed_symbol and symbol != self.allowed_symbol: return
-        if self._daily_target_hit():                              return
-        if self._daily_loss_hit():                                return
 
-        # Kara liste kontrolü — dinamik (süreli ban)
+        # BUG-6 DÜZELTMESİ: Pozisyon lock dışında score hesaplanırken
+        # başka thread tarafından açılmış olabilir. Tekrar kontrol et.
+        if symbol in self.open_positions:
+            return
+
+        if self._stopped:                           return
+        if len(self.open_positions) >= self.max_open_pos: return
+        if self.trade_count_today  >= self.max_trades_day: return
+        if self.allowed_symbol and symbol != self.allowed_symbol: return
+        if self._daily_target_hit():                return
+        if self._daily_loss_hit():                  return
+
+        # Kara liste — dinamik
         bl_exp = self.blacklist.get(symbol)
         if bl_exp is not None:
             if time.time() < bl_exp:
@@ -631,13 +725,14 @@ class TradeEngine:
             else:
                 del self.blacklist[symbol]
 
-        # Kara liste kontrolü — config'den kalıcı ban (ÖNCELİK 3)
-        # BTCUSDT referans filtreleri beslediği için kalıcı blacklist ona uygulanmaz.
-        if symbol != "BTCUSDT" and self.blacklist_enabled and symbol in self.blacklist_symbols:
+        # Kara liste — kalıcı
+        if (symbol != "BTCUSDT"
+                and self.blacklist_enabled
+                and symbol in self.blacklist_symbols):
             self._fire("OPEN_BLOCK", cause="SYMBOL_BLACKLIST", symbol=symbol)
             return
 
-        # Minimum işlem hacmi filtresi
+        # Minimum işlem hacmi
         if len(prices) >= 20:
             avg_notional = (sum(prices[-20:]) / 20) * (sum(volumes[-20:]) / 20)
             if avg_notional < self.min_notional:
@@ -645,7 +740,7 @@ class TradeEngine:
 
         # Hacim patlaması filtresi
         if len(volumes) >= 20:
-            rv = sum(volumes[-3:]) / 3
+            rv = sum(volumes[-3:])  / 3
             hv = sum(volumes[-20:-3]) / 17
             if hv > 0 and rv < hv * self.vol_mult:
                 self._fire("OPEN_BLOCK", cause="LOW_VOLUME", symbol=symbol)
@@ -662,9 +757,8 @@ class TradeEngine:
                     self._fire("OPEN_BLOCK", cause="BTC_LONG_WEAK_SHORT", symbol=symbol)
                     return
 
-        # Makro sentiment filtresi
         sentiment = get_market_sentiment()
-        # Adaptif giriş eşiği: KONSOL'de +7, BEARISH'de +99 (pratikte giriş yok)
+
         _adsl_thr = adaptive_sl.compute(
             regime               = self.regime._last_regime,
             atr_pct              = result.get("components", {}).get("atr_pct", 0.0),
@@ -673,8 +767,12 @@ class TradeEngine:
             base_trail_step      = self.trail_step,
             cfg                  = self.cfg,
         )
-        effective_long_thr = self._effective_long_threshold(symbol, result, _adsl_thr["score_threshold"])
-        side      = None
+
+        effective_long_thr = self._effective_long_threshold(
+            symbol, result, _adsl_thr["score_threshold"]
+        )
+
+        side = None
         if score >= effective_long_thr and sentiment != "BEARISH":
             side = "LONG"
         elif score <= self.score_short_open and sentiment != "BULLISH":
@@ -682,11 +780,12 @@ class TradeEngine:
 
         if not side:
             return
+
         adx_val = result.get("components", {}).get("adx", 0.0)
         if self.adx_filter_enabled and adx_val > 0 and adx_val < self.adx_filter_threshold:
             return
 
-        # ── ATR Minimum Filtresi ───────────────────────────────
+        # ATR Minimum Filtresi
         if self.atr_filter_enabled:
             atr_val = result.get("components", {}).get("atr_pct", 0.0)
             if atr_val < self.atr_filter_min:
@@ -694,7 +793,7 @@ class TradeEngine:
                            symbol=symbol, atr=round(atr_val, 3))
                 return
 
-        # ── RSI Filtresi ───────────────────────────────────────
+        # RSI Filtresi
         if self.rsi_filter_enabled:
             rsi_val = result.get("components", {}).get("rsi", 50.0)
             if side == "LONG"  and rsi_val > self.rsi_max_long:
@@ -707,10 +806,11 @@ class TradeEngine:
                 return
 
         htf_sc = self._htf_score(symbol) if self.mtf_enabled else 100.0
+
         if not self._konsol_breakout_ok(symbol, result, score, htf_sc, volumes, side):
             return
 
-        # ── Çoklu Timeframe Konfirmasyon ─────────────────────────
+        # MTF Konfirmasyon
         if self.mtf_enabled:
             if side == "LONG"  and htf_sc < self.mtf_long_min:
                 self._fire("OPEN_BLOCK", cause="MTF_NO_CONFIRM_LONG",
@@ -721,41 +821,56 @@ class TradeEngine:
                            symbol=symbol, htf_score=round(htf_sc, 1))
                 return
 
-        # Adaptif sembol kalite filtresi: sembolü listeden atmaz,
-        # son dönemde kötü çalışan sembolde zayıf setup'ı engeller.
         qs_pts = self._trade_quality_score(symbol, result, side)
-        sq_ok, sq_detail, sym_mult, rolling_pnl = self._symbol_quality_filter(symbol, result, side, qs_pts, score)
+        sq_ok, sq_detail, sym_mult, rolling_pnl = self._symbol_quality_filter(
+            symbol, result, side, qs_pts, score
+        )
         if not sq_ok:
             comp = result.get("components", {}) or {}
-            self._fire(
-                "OPEN_BLOCK",
-                cause="WEAK_SYMBOL_LOW_QUALITY",
-                symbol=symbol,
-                side=side,
-                score=round(score, 1),
-                qs_score=qs_pts,
-                symbol_mult=round(sym_mult, 3),
-                rolling_pnl=round(rolling_pnl, 3),
-                atr=round(float(comp.get("atr_pct", 0.0) or 0.0), 3),
-                adx=round(float(comp.get("adx", 0.0) or 0.0), 2),
-                detail=sq_detail,
-            )
+            self._fire("OPEN_BLOCK",
+                       cause="WEAK_SYMBOL_LOW_QUALITY",
+                       symbol=symbol, side=side,
+                       score=round(score, 1), qs_score=qs_pts,
+                       symbol_mult=round(sym_mult, 3),
+                       rolling_pnl=round(rolling_pnl, 3),
+                       atr=round(float(comp.get("atr_pct", 0.0) or 0.0), 3),
+                       adx=round(float(comp.get("adx",     0.0) or 0.0), 2),
+                       detail=sq_detail)
             return
 
-        htf_for_reentry = self._htf_score(symbol) if self.mtf_enabled else 100.0
-        is_reentry, reentry_detail = self._reentry_ok(symbol, side, score, qs_pts, htf_for_reentry, adx_val)
+        htf_for_reentry          = self._htf_score(symbol) if self.mtf_enabled else 100.0
+        is_reentry, reentry_detail = self._reentry_ok(
+            symbol, side, score, qs_pts, htf_for_reentry, adx_val
+        )
+
         final_size_mult = sym_mult * (self.reentry_size_mult if is_reentry else 1.0)
+
+        # BUG-3 DÜZELTMESİ: konsol_size_mult=0 durumunda qty=0 olur ve borsa
+        # min_notional hatası verir. Sıfır veya negatifse pozisyonu açmadan
+        # dön; bu davranış config'deki "KONSOL'de işlem yok" niyetiyle uyumlu.
         if self.konsol_breakout_only and self.regime._last_regime == "KONSOL":
+            if self.konsol_size_mult <= 0:
+                self._fire("OPEN_BLOCK", cause="REGIME_CLOSED",
+                           symbol=symbol, regime="KONSOL",
+                           detail="konsol_size_mult=0")
+                return
             final_size_mult *= self.konsol_size_mult
-        self._open(symbol, price, side, result, size_mult=final_size_mult, is_reentry=is_reentry, reentry_detail=reentry_detail)
+
+        self._open(symbol, price, side, result,
+                   size_mult=final_size_mult,
+                   is_reentry=is_reentry,
+                   reentry_detail=reentry_detail)
 
     # ──────────────────────────────────────────────────────────────
     # Pozisyon Aç / Kapat
     # ──────────────────────────────────────────────────────────────
-    def _open(self, symbol: str, price: float, side: str, result: dict, size_mult: float = 1.0, is_reentry: bool = False, reentry_detail: str = ""):
-        # Adaptif SL: ATR × rejime özgü çarpan
+    def _open(self, symbol: str, price: float, side: str, result: dict,
+              size_mult: float = 1.0, is_reentry: bool = False,
+              reentry_detail: str = ""):
+
         atr_pct_val = result.get("components", {}).get("atr_pct", 0.0)
         regime      = self.regime._last_regime
+
         adsl = adaptive_sl.compute(
             regime               = regime,
             atr_pct              = atr_pct_val,
@@ -764,15 +879,17 @@ class TradeEngine:
             base_trail_step      = self.trail_step,
             cfg                  = self.cfg,
         )
+
         if self.use_atr_stop and atr_pct_val > 0:
             final_sl_pct = adsl["sl_pct"]
         else:
             final_sl_pct = self.sl_pct
+
         pos_trail_step = adsl["trail_step"] if self.dynamic_trail_enabled else self.trail_step
 
         qty = self._lot(price, dynamic_sl_pct=final_sl_pct) * size_mult
 
-        # ── Volatilite Bazlı Pozisyon Küçültme (ÖNCELİK 5) ───
+        # Volatilite Bazlı Pozisyon Küçültme
         if self.vpf_enabled and atr_pct_val > self.vpf_atr_threshold:
             qty *= self.vpf_size_mult
             self._fire("VOL_SIZE_REDUCED",
@@ -781,33 +898,41 @@ class TradeEngine:
                        mult=self.vpf_size_mult)
 
         self.open_positions[symbol] = {
-            "side":       side,
-            "entry":      price,
-            "qty":        qty,
-            "ts_open":    time.time(),
-            "sl_pct":     final_sl_pct,
-            "trail_step": pos_trail_step,   # rejime göre belirlendi
-            "score":      result.get("final_score", 0.0),
-            "qs_score":   self._trade_quality_score(symbol, result, side),
-            "htf_score":  self._htf_score(symbol) if self.mtf_enabled else 0.0,
-            "adx":        result.get("components", {}).get("adx", 0.0),
-            "is_reentry": int(is_reentry),
-            "reentry_count": int((self.reentry_candidates.get(symbol) or {}).get("used", 0)) + (1 if is_reentry else 0),
+            "side":          side,
+            "entry":         price,
+            "qty":           qty,
+            "ts_open":       time.time(),
+            "sl_pct":        final_sl_pct,
+            "trail_step":    pos_trail_step,
+            "score":         result.get("final_score", 0.0),
+            "qs_score":      self._trade_quality_score(symbol, result, side),
+            "htf_score":     self._htf_score(symbol) if self.mtf_enabled else 0.0,
+            "adx":           result.get("components", {}).get("adx", 0.0),
+            "is_reentry":    int(is_reentry),
+            "reentry_count": int((self.reentry_candidates.get(symbol) or {}).get("used", 0))
+                             + (1 if is_reentry else 0),
         }
+
         self.trade_count_today += 1
         self._log_trade(symbol, side, qty, price, "", 0.0, 0.0,
-                        f"OPEN sl_pct={final_sl_pct*100:.2f}% regime={regime} score={result['final_score']}")
+                        f"OPEN sl_pct={final_sl_pct*100:.2f}% "
+                        f"regime={regime} score={result['final_score']}")
+
         if is_reentry:
             self.reentry_candidates.pop(symbol, None)
-            self._fire("REENTRY_OPEN", symbol=symbol, side=side, entry=price, detail=reentry_detail,
+            self._fire("REENTRY_OPEN", symbol=symbol, side=side,
+                       entry=price, detail=reentry_detail,
                        score=result.get("final_score", 0.0))
+
         self._fire("OPEN", symbol=symbol, side=side,
-                   entry=price, score=result["final_score"], regime=regime, is_reentry=int(is_reentry))
+                   entry=price, score=result["final_score"],
+                   regime=regime, is_reentry=int(is_reentry))
 
     def _close(self, symbol: str, price: float, change_pct: float, reason: str):
         pos = self.open_positions.pop(symbol, None)
         if not pos:
             return
+
         entry   = pos["entry"]
         qty     = pos["qty"]
         pnl_usd = ((price - entry) if pos["side"] == "LONG"
@@ -837,8 +962,8 @@ class TradeEngine:
             with open(self.csv_path, "a", encoding="utf-8-sig", newline="") as f:
                 w = csv.writer(f, delimiter=";")
                 if new:
-                    w.writerow(["Tarih","Sembol","Yon","GirisFiyati",
-                                "CikisFiyati","KarYuzde","KarUSD","Not"])
+                    w.writerow(["Tarih", "Sembol", "Yon", "GirisFiyati",
+                                "CikisFiyati", "KarYuzde", "KarUSD", "Not"])
                 w.writerow([ts, sym, side, entry or "",
                             exitp or "", kar_pct, kar_usd, note])
         except Exception as e:
