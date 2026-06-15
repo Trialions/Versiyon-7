@@ -12,7 +12,7 @@
 # 1) GENEL ÇALIŞMA / VERİ AYARLARI
 # ============================================================
 mode:
-  top_n: 40
+  top_n: 20
   interval: 5m
   shard_size: 30
   preload_candles: 1000
@@ -79,7 +79,7 @@ risk:
   trend_size_boost: 1.5
 
 limits:
-  max_open_positions: 3
+  max_open_positions: 4
   max_trades_per_day: 8
   max_hold_hours: 48
   daily_target_pct: 10
@@ -97,7 +97,7 @@ pyramiding:
 partial_tp:
   enabled: true
   tp1_r_mult: 2.5
-  close_pct: 0.10
+  close_pct: 0.40
 
 dynamic_trail:
   enabled: false
@@ -191,7 +191,7 @@ adaptive_risk:
 # 10) SEMBOL BAZLI FİLTRELER
 # ============================================================
 symbol_blacklist:
-  enabled: true
+  enabled: false
   symbols:
     - LINKUSDT
     - FETUSDT
@@ -350,4 +350,32 @@ adaptive_exit:
       breakeven_buffer_pct: 0.10
       allow_trend_runner: false
       size_mult: 0.75
-
+# ============================================================
+# 14) BLOCK OUTCOME ANALYZER
+# ------------------------------------------------------------
+# Engel yiyen sinyallerin 4/8/12/24 saat sonra ne yaptığını
+# analiz eder. first_hit (TP mi SL mi önce?) ile gereksiz
+# engelleri tespit eder. Cooldown ile veri boyutunu kontrol eder.
+# ============================================================
+block_outcome_analysis:
+  enabled: true
+  horizons_hours: [4, 8, 12, 24]
+  cooldown_bars: 12          # 5m için = 1 saat (1h test için 12 bar = 12 saat)
+  bar_seconds: 300           # 5m = 300, 1h = 3600, 4h = 14400
+  max_per_reason: 5000
+  only_reasons:
+    - SCORE_THRESHOLD
+    - REGIME_CLOSED
+    - LOW_VOLUME
+    - ADX_FILTER
+    - LOW_NOTIONAL
+    - MTF_NO_CONFIRM
+    - RSI_TOO_HIGH
+    - ATR_TOO_LOW
+    - SYMBOL_BLACKLIST
+    - WEAK_SYMBOL_LOW_QUALITY
+    - KONSOL_LOW_SCORE
+    - KONSOL_WEAK_ADX
+    - KONSOL_LOW_ATR
+    - KONSOL_NO_VOLUME_BREAKOUT
+    - KONSOL_HTF_WEAK
