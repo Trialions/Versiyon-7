@@ -1,0 +1,282 @@
+# ============================================================
+# TRBOT CONFIG - Düzenli ve Güncel Sürüm
+# ------------------------------------------------------------
+# Not:
+# - Kod uyumluluğu için mevcut anahtar yapısı korunmuştur.
+# - Sadece bölümleme, sıralama ve okunabilirlik düzenlenmiştir.
+# - Ghost Trade Analysis ve Dynamic Threshold güncel modülleri eklidir.
+# ============================================================
+
+
+# ============================================================
+# 1) GENEL ÇALIŞMA / VERİ AYARLARI
+# ============================================================
+mode:
+  top_n: 40
+  interval: 5m
+  shard_size: 30
+  preload_candles: 1000
+
+misc:
+  starting_equity_usdt: 1000
+  min_notional_usdt: 30000
+  volume_burst_multiplier: 1
+  oco_enabled: true
+  commission_pct: 0.04
+  slippage_pct: 0.03
+
+
+# ============================================================
+# 2) ANA GİRİŞ SKOR EŞİKLERİ
+# ============================================================
+thresholds:
+  score_long_open: 97
+  score_short_open: 10
+  score_close: 50
+
+
+# ============================================================
+# 3) DYNAMIC THRESHOLD / REJİME GÖRE GİRİŞ EŞİĞİ
+# ------------------------------------------------------------
+# enabled: true ise sabit score_long_open yerine rejime göre eşik kullanılır.
+# Amaç: TREND'de fırsatı artırmak, KONSOL/BEARISH'te sıkılaşmak.
+# ============================================================
+dynamic_threshold:
+  enabled: true
+
+  trend_score: 95
+  neutral_score: 96
+  konsol_score: 99
+  bearish_score: 999
+
+  min_score: 88
+  max_score: 999
+
+  strong_setup_discount: 2
+  strong_htf: 75
+  strong_adx: 35
+  strong_rsi_max: 68
+
+
+# ============================================================
+# 4) RİSK VE POZİSYON YÖNETİMİ
+# ============================================================
+risk:
+  risk_per_trade_pct: 1
+
+  hard_stop_pct: 3
+  use_atr_stop: true
+  atr_multiplier: 2.5
+  max_stop_pct: 3
+
+  take_profit_min_pct: 4
+  min_profit_close_pct: 2
+  min_hold_minutes: 60
+
+  use_trailing: true
+  trailing_step_pct: 1.2
+
+  trend_size_boost: 1.5
+
+limits:
+  max_open_positions: 3
+  max_trades_per_day: 8
+  max_hold_hours: 48
+  daily_target_pct: 10
+  daily_loss_limit_pct: 8
+
+pyramiding:
+  enabled: false
+  step_pct: 15
+  max_steps: 3
+
+
+# ============================================================
+# 5) TAKE PROFIT / TRAILING / DYNAMIC TRAIL
+# ============================================================
+partial_tp:
+  enabled: true
+  tp1_r_mult: 2.5
+  close_pct: 0.10
+
+dynamic_trail:
+  enabled: false
+  atr_mult: 1
+  min_pct: 0.5
+  max_pct: 2.5
+
+
+# ============================================================
+# 6) MULTI TIMEFRAME / HTF ONAYI
+# ============================================================
+mtf:
+  enabled: true
+  htf_interval: 4h
+  htf_long_min: 65
+  htf_short_max: 45
+  preload_candles_htf: 500
+
+
+# ============================================================
+# 7) PİYASA / TREND / VOLATİLİTE FİLTRELERİ
+# ============================================================
+btc_filter:
+  enabled: true
+  lookback_candles: 4
+  drop_pct: 1.5
+
+adx_filter:
+  enabled: true
+  threshold: 40
+
+rsi_filter:
+  enabled: true
+  max_long: 70
+  min_short: 30
+
+atr_filter:
+  enabled: true
+  min_atr_pct: 1.4
+
+funding_filter:
+  enabled: false
+  long_max: 0.0005
+  short_min: -0.0005
+
+
+# ============================================================
+# 8) MARKET REGIME / KONSOL BREAKOUT FİLTRESİ
+# ------------------------------------------------------------
+# KONSOL tamamen kapalı değil.
+# Sadece breakout kalitesi varsa ve daha küçük boyutla işlem açılır.
+# ============================================================
+market_regime:
+  enabled: true
+
+  ema_fast: 10
+  ema_slow: 21
+  ema_long: 55
+
+  atr_mult_thresh: 1.8
+  vol_window: 20
+  vol_burst_mult: 1.5
+  min_candles: 70
+
+  konsol_breakout_only: true
+  konsol_min_score: 98
+  konsol_min_adx: 25
+  konsol_min_atr_pct: 1.2
+  konsol_min_vol_ratio: 1.2
+  konsol_min_htf: 65
+  konsol_rsi_max_long: 68
+  konsol_size_mult: 0.0
+
+
+# ============================================================
+# 9) QUALITY SCORE / ADAPTIVE RISK
+# ============================================================
+quality_score:
+  enabled: true
+  min_half_pos: 9
+  min_full_pos: 10
+
+adaptive_risk:
+  enabled: true
+  loss3_mult: 0.75
+  loss5_mult: 0.5
+  loss8_mult: 0.25
+
+
+# ============================================================
+# 10) SEMBOL BAZLI FİLTRELER
+# ============================================================
+symbol_blacklist:
+  enabled: true
+  symbols:
+    - LINKUSDT
+    - FETUSDT
+    - ALLOUSDT
+    - LTCUSDT
+    - HOMEUSDT
+    - TONUSDT
+    - PENGUUSDT
+    - TRXUSDT
+    - NEARUSDT 
+
+auto_symbol_filter:
+  enabled: true
+  rolling_window: 10
+  min_trades: 1
+
+  tier1_pct: -1
+  tier2_pct: -4
+  tier3_pct: -7
+  min_multiplier: 0.25
+
+  # Eski sabit dolar fallback değerleri
+  tier1_pnl: -30
+  tier2_pnl: -60
+  tier3_pnl: -100
+
+symbol_quality_filter:
+  enabled: true
+  weak_symbol_multiplier: 0.5
+  min_qs: 8
+  min_atr_pct: 1.2
+  min_adx: 20
+  score_bonus: 5
+
+vol_position_filter:
+  enabled: false
+  high_atr_threshold: 2.5
+  high_atr_size_mult: 0.5
+
+
+# ============================================================
+# 11) SL SONRASI RE-ENTRY / FAKE STOP KORUMASI
+# ============================================================
+reentry:
+  enabled: false
+  max_reentries: 1
+  window_bars: 8
+  cooldown_bars: 0
+
+  min_score: 90
+  min_qs: 5
+  min_htf: 60
+  min_adx: 20
+
+  size_mult: 0.5
+  bar_seconds: 3600
+
+
+# ============================================================
+# 12) GHOST TRADE ANALYSIS / REDDEDİLEN SİNYAL ANALİZİ
+# ------------------------------------------------------------
+# Reddedilen sinyallerin 4h / 12h / 24h sonra ne yaptığını ölçer.
+# Amaç: hangi filtrenin iyi fırsatları kaçırdığını görmek.
+# ============================================================
+ghost_trade_analysis:
+  enabled: true
+
+  horizons_hours:
+    - 4
+    - 12
+    - 24
+
+  tp_pct: 4.0
+  sl_pct: 3.0
+
+
+# ============================================================
+# 13) WALK-FORWARD / HAFTALIK SEMBOL ROTASYONU NOTLARI
+# ------------------------------------------------------------
+# Bu blok ana motor tarafından şart değil; dokümantasyon ve WF komutları için.
+# Haftalık sembol rotasyonu walk_forward.py argümanlarıyla çalışır:
+# --weekly-symbols --symbol-lookback-days 30 --symbol-refresh-days 7 --candidate-top 70
+# ============================================================
+weekly_symbol_rotation:
+  enabled: true
+  lookback_days: 30
+  refresh_days: 7
+  candidate_top: 120
