@@ -280,3 +280,74 @@ weekly_symbol_rotation:
   lookback_days: 30
   refresh_days: 7
   candidate_top: 120
+
+# ============================================================
+# 14) ADAPTIVE EXIT / TRADE MANAGEMENT CLASSIFIER — V7
+# ------------------------------------------------------------
+# İlk sürüm SHADOW MODE'dadır: canlı/backtest çıkışlarını değiştirmez,
+# sadece trade_class / continuation_score / policy önerisini loglar.
+# KONSOL/CHOP/RANGE rejimde TREND_RUNNER kesinlikle yasaktır.
+# ============================================================
+adaptive_exit:
+  enabled: true
+  shadow_mode: true
+  min_confidence: 55
+  trend_runner_min_score: 75
+  scalp_exit_max_score: 45
+  exhausted_rsi: 72
+  strict_chop_guard: true
+
+  symbol_behavior:
+    enabled: true
+    min_closed_trades: 25
+    full_weight_trades: 50
+    min_ghost_samples: 100
+    max_score_impact: 10
+    neutral_score: 50
+
+  policies:
+    TREND_RUNNER:
+      tp1_close_pct: 0.08
+      trail_step_pct: 2.20
+      max_hold_hours: 72
+      breakeven_after_r: 1.0
+      breakeven_buffer_pct: 0.25
+      allow_trend_runner: true
+      size_mult: 1.0
+
+    NORMAL:
+      tp1_close_pct: 0.10
+      trail_step_pct: 1.20
+      max_hold_hours: 48
+      breakeven_after_r: 1.0
+      breakeven_buffer_pct: 0.15
+      allow_trend_runner: false
+      size_mult: 1.0
+
+    SCALP_EXIT:
+      tp1_close_pct: 0.45
+      trail_step_pct: 0.75
+      max_hold_hours: 18
+      breakeven_after_r: 0.80
+      breakeven_buffer_pct: 0.12
+      allow_trend_runner: false
+      size_mult: 1.0
+
+    CHOP_RISK:
+      tp1_close_pct: 0.50
+      trail_step_pct: 0.60
+      max_hold_hours: 12
+      breakeven_after_r: 0.70
+      breakeven_buffer_pct: 0.10
+      allow_trend_runner: false
+      size_mult: 0.75
+
+    EXHAUSTED:
+      tp1_close_pct: 0.60
+      trail_step_pct: 0.60
+      max_hold_hours: 12
+      breakeven_after_r: 0.70
+      breakeven_buffer_pct: 0.10
+      allow_trend_runner: false
+      size_mult: 0.75
+
