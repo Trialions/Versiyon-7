@@ -46,6 +46,7 @@ from logger import log_info, log_error
 from symbol_manager import SymbolManager
 from market_regime import MarketRegimeDetector
 import adaptive_sl
+from adaptive_exit import classify_trade, decision_note, get_adaptive_exit_config
 
 import os as _os
 _SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
@@ -199,6 +200,7 @@ def _sharpe(equity_curve, risk_free=0.0):
 class Backtester:
     def __init__(self, cfg: dict):
         self.cfg  = cfg   # adaptive_sl.compute'a iletilecek
+        self.adaptive_exit_cfg = get_adaptive_exit_config(self.cfg)
         risk  = cfg.get("risk",       {})
         lim   = cfg.get("limits",     {})
         thr   = cfg.get("thresholds", {})
@@ -640,6 +642,18 @@ class Backtester:
             "qs_score":     pos.get("qs_score", 0),
             "regime":       self.regime._last_regime,
             "trail_locked": round((pos.get("trail_locked") or 0) * 100, 3),
+            "trade_class":              pos.get("trade_class", ""),
+            "continuation_score":       pos.get("continuation_score", ""),
+            "adaptive_exit_policy":     pos.get("adaptive_exit_policy", ""),
+            "adaptive_exit_confidence": pos.get("adaptive_exit_confidence", ""),
+            "adaptive_exit_shadow":     pos.get("adaptive_exit_shadow", ""),
+            "adaptive_exit_reasons":    pos.get("adaptive_exit_reasons", ""),
+            "trade_class":              pos.get("trade_class", ""),
+            "continuation_score":       pos.get("continuation_score", ""),
+            "adaptive_exit_policy":     pos.get("adaptive_exit_policy", ""),
+            "adaptive_exit_confidence": pos.get("adaptive_exit_confidence", ""),
+            "adaptive_exit_shadow":     pos.get("adaptive_exit_shadow", ""),
+            "adaptive_exit_reasons":    pos.get("adaptive_exit_reasons", ""),
         })
 
     def _exit_reason(self, pos, price, change, score):
@@ -700,6 +714,12 @@ class Backtester:
             "htf_score": round(pos.get("htf_score", 0.0), 1),
             "vol_ratio": round(pos.get("vol_ratio", 0.0), 2),
             "btc_trend": pos.get("btc_trend", 1),
+            "trade_class":              pos.get("trade_class", ""),
+            "continuation_score":       pos.get("continuation_score", ""),
+            "adaptive_exit_policy":     pos.get("adaptive_exit_policy", ""),
+            "adaptive_exit_confidence": pos.get("adaptive_exit_confidence", ""),
+            "adaptive_exit_shadow":     pos.get("adaptive_exit_shadow", ""),
+            "adaptive_exit_reasons":    pos.get("adaptive_exit_reasons", ""),
             "regime":    self.regime._last_regime,
         })
 
@@ -1061,12 +1081,39 @@ class Backtester:
         comp      = result.get("components", {})
         vol_ratio = round(volumes[-1] / (sum(volumes[-20:-1]) / 19), 2) if len(volumes) >= 20 else 0.0
         htf_sc_log = round(self._htf_score(symbol), 1)
+
+        # -- Adaptive Exit Shadow Classifier -- V7 v2 SAFE ------------------
+        _ae_comp   = result.get("components", {}) or {}
+        _ae_htf    = htf_sc_log
+        _ae_btc_ok = self._btc_trend_ok(side)
+        ae_decision = classify_trade(
+            symbol=symbol,
+            side=side,
+            score=score,
+            htf_score=_ae_htf,
+            regime=self.regime._last_regime,
+            components=_ae_comp,
+            cfg=self.cfg,
+            prices=prices,
+            highs=highs,
+            lows=lows,
+            volumes=volumes,
+            current_r=0.0,
+            btc_trend_ok=_ae_btc_ok,
+        )
+        # -- Adaptive Exit Shadow Classifier -- SON ---------------------------
         self.open_positions[symbol] = {
             "side":         side,
             "entry":        price,
             "qty":          qty,
             "sl_pct":       final_sl,
             "trail_step":   pos_trail_step,   # rejime göre belirlendi
+            "trade_class":              ae_decision.trade_class,
+            "continuation_score":       ae_decision.continuation_score,
+            "adaptive_exit_policy":     ae_decision.policy_name,
+            "adaptive_exit_confidence": ae_decision.confidence,
+            "adaptive_exit_shadow":     int(ae_decision.shadow_mode),
+            "adaptive_exit_reasons":    ae_decision.reasons,
             "ts_open":      ts_sec,
             "score":        score,
             "atr_pct":      round(comp.get("atr_pct",  0.0), 3),
@@ -1146,6 +1193,12 @@ class Backtester:
             "open_time":    datetime.utcfromtimestamp(pos["ts_open"]).strftime("%Y-%m-%d %H:%M"),
             "close_time":   datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M"),
             "hold_min":     round((ts_ms / 1000 - pos["ts_open"]) / 60, 1),
+            "trade_class":              pos.get("trade_class", ""),
+            "continuation_score":       pos.get("continuation_score", ""),
+            "adaptive_exit_policy":     pos.get("adaptive_exit_policy", ""),
+            "adaptive_exit_confidence": pos.get("adaptive_exit_confidence", ""),
+            "adaptive_exit_shadow":     pos.get("adaptive_exit_shadow", ""),
+            "adaptive_exit_reasons":    pos.get("adaptive_exit_reasons", ""),
         })
 
         # ── TP Post-Analysis kaydı (TP / TP1 / Trail) ────────
@@ -1670,6 +1723,8 @@ def generate_report(trades, starting_equity, final_equity,
             "qs_score", "regime", "trail_locked",
             "chg_1h_pct", "chg_4h_pct", "chg_12h_pct", "chg_24h_pct",
             "max_up_24h", "max_dn_24h", "missed_pct", "verdict",
+            "trade_class", "continuation_score", "adaptive_exit_policy",
+            "adaptive_exit_confidence", "adaptive_exit_shadow", "adaptive_exit_reasons",
         ]
         with open(tp_csv, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=tp_fields, delimiter=";",
