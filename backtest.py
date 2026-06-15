@@ -47,6 +47,7 @@ from symbol_manager import SymbolManager
 from market_regime import MarketRegimeDetector
 import adaptive_sl
 from adaptive_exit import classify_trade, decision_note, get_adaptive_exit_config
+from block_outcome_analyzer import build_block_outcome, write_block_outcome_reports
 
 import os as _os
 _SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
@@ -1358,10 +1359,11 @@ def _write_ghost_summaries(out_dir: Path, ghost_rows: list):
 def generate_report(trades, starting_equity, final_equity,
                     equity_curve, out_dir, label="",
                     sl_records=None, all_candles=None, block_log=None,
-                    tp_records=None):
+                    tp_records=None, cfg=None):
     out_dir.mkdir(parents=True, exist_ok=True)
-    if not trades:
-        print("\n[UYARI] Hiç işlem oluşmadı. Parametreleri gevşet.")
+    _no_trades = not trades
+    if _no_trades:
+        print("\n[UYARI] Hiç işlem oluşmadı. Trade summary boş, BOA devam edecek.")
         s_csv = out_dir / "backtest_summary.csv"
         with open(s_csv, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f, delimiter=";")
@@ -1371,7 +1373,7 @@ def generate_report(trades, starting_equity, final_equity,
                 ["BitisEquity",     f"${final_equity:.2f}"],
                 ["ToplamIslem",     0],
             ])
-        return {}
+        # return kaldırıldı — 0 trade aylarında BOA yine çalışsın
 
     wins   = [t for t in trades if t["net_pnl"] > 0]
     losses = [t for t in trades if t["net_pnl"] <= 0]
@@ -1547,6 +1549,34 @@ def generate_report(trades, starting_equity, final_equity,
                 w.writeheader(); w.writerows(ghost_rows)
             print(f"  Ghost sinyal analizi: {ghost_csv}")
             _write_ghost_summaries(out_dir, ghost_rows)
+
+    # ── Block Outcome Analyzer: engel yiyen sinyaller first_hit + cooldown ──
+    # Mevcut ghost_signal_analysis üzerine first_hit, 8h pencere,
+    # cooldown ve 4 raporlu özet ekler.
+    _boa_cfg     = (cfg or {}).get("block_outcome_analysis", {})
+    _boa_enabled = bool(_boa_cfg.get("enabled", True))
+    if _boa_enabled and block_log and all_candles:
+        _boa_tp        = float((cfg or {}).get("ghost_trade_analysis", {}).get("tp_pct", 4.0)) / 100
+        _boa_sl        = float((cfg or {}).get("ghost_trade_analysis", {}).get("sl_pct", 3.0)) / 100
+        _boa_horizons  = list( _boa_cfg.get("horizons_hours",  [4, 8, 12, 24]))
+        _boa_cooldown  = int(  _boa_cfg.get("cooldown_bars",   12))
+        _boa_max_per   = int(  _boa_cfg.get("max_per_reason",  5000))
+        _boa_reasons   = set(  _boa_cfg.get("only_reasons",    [])) or None
+        _boa_bar_sec = int(_boa_cfg.get("bar_seconds", 300))
+        _boa_rows = build_block_outcome(
+            block_log      = block_log,
+            all_candles    = all_candles,
+            tp_pct         = _boa_tp,
+            sl_pct         = _boa_sl,
+            horizons_hours = _boa_horizons,
+            cooldown_bars  = _boa_cooldown,
+            bar_seconds    = _boa_bar_sec,
+            only_reasons   = _boa_reasons,
+            max_per_reason = _boa_max_per,
+        )
+        if _boa_rows:
+            write_block_outcome_reports(out_dir, _boa_rows, _boa_horizons)
+            print(f"  Block Outcome Analizi: {len(_boa_rows)} kayıt, {out_dir}")
 
     # ── SL Post-Analysis ──────────────────────────────────────
     if sl_records and all_candles:
