@@ -589,6 +589,7 @@ def run_walk_forward(
                 all_candles={s: seg_candles[s] for s in seg_symbols if s in seg_candles},
                 block_log=bt.block_log,
                 tp_records=bt.tp_records,
+                cfg=cfg,
             )
 
     active = [r for r in results if r.get("n", 0) > 0]
