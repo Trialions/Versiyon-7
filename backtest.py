@@ -1386,8 +1386,8 @@ def generate_report(trades, starting_equity, final_equity,
     avg_win     = sum(t["net_pnl"] for t in wins)   / len(wins)   if wins   else 0
     avg_loss    = sum(t["net_pnl"] for t in losses) / len(losses) if losses else 0
     rr          = abs(avg_win / avg_loss) if avg_loss else 0
-    max_gain    = max(t["net_pnl"] for t in trades)
-    max_loss    = min(t["net_pnl"] for t in trades)
+    max_gain    = max((t["net_pnl"] for t in trades), default=0.0)
+    max_loss    = min((t["net_pnl"] for t in trades), default=0.0)
     avg_hold    = sum(t["hold_min"] for t in trades) / total if total else 0
     max_dd      = _max_drawdown(equity_curve)
     sharpe      = _sharpe(equity_curve)
